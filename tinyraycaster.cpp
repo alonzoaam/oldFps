@@ -1,165 +1,98 @@
-
+#define _USE_MATH_DEFINES
 #include <cmath>
 #include <iostream>
-#include <fstream>
 #include <vector>
 #include <cstdint>
 #include <cassert>
-#define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
+#include <sstream>
+#include <iomanip>
 
-// colors are stored in uint32_t (four bytes) R, G, B, A
-uint32_t pack_color(const uint8_t r, const uint8_t g, const uint8_t b, const uint8_t a=255) {
-    return (a<<24) + (b<<16) + (g<<8) + r;
-}
-void unpack_color(const uint32_t &color, uint8_t &r, uint8_t &g, uint8_t &b, uint8_t &a) {
-    r = (color >> 0) & 255;
-    g = (color >> 8) & 255;
-    b = (color >> 16) & 255;
-    a = (color >> 24) & 255;
-}
-// pack and unpack allow you to work with color channels
+#include "map.h"
+#include "utils.h"
+#include "player.h"
+#include "sprite.h"
+#include "framebuffer.h"
+#include "textures.h"
 
-//
-void drop_ppm_image(const std::string filename, const std::vector<uint32_t> &image, const size_t w, const size_t h) {
-    assert(image.size() == w*h);
-    std::ofstream ofs(filename, std::ios::binary);
-    ofs << "P6\n" << w << " " << h << "/n255/n";
-    for (size_t i = 0; i < h*w; ++i) {
-        uint8_t r, g, b, a;
-        unpack_color(image[i], r, g, b, a);
-        ofs << static_cast<char>(r) << static_cast<char>(g) << static_cast<char>(b);
-    }
-    ofs.close();
+int wall_x_texcoord(const float hitx, const float hity, Texture &tex_walls) {
+    float x = hitx - floor(hitx+.5); // x and y contain (signed) fractional parts of hitx and hity,
+    float y = hity - floor(hity+.5); // they vary between -0.5 and +0.5, and one of them is supposed to be very close to 0
+    int tex = x*tex_walls.size;
+    if (std::abs(y)>std::abs(x)) // we need to determine whether we hit a "vertical" or a "horizontal" wall (w.r.t the map)
+        tex = y*tex_walls.size;
+    if (tex<0) // do not forget x_texcoord can be negative, fix that
+        tex += tex_walls.size;
+    assert(tex>=0 && tex<(int)tex_walls.size);
+    return tex;
 }
 
-void draw_rectangle(std::vector<uint32_t> &img, const size_t img_w, const size_t img_h, const size_t x, const size_t y, const size_t w, const size_t h, const uint32_t color) {
-    assert(img.size()==img_w*img_h);
-    for(size_t i=0; i<w; i++) {
-        for (size_t j=0; j<h; j++) {
-            size_t cx = x+i;
-            size_t cy = y+j;
-            if (cx >= img_w || cy >= img_h) continue;
-            img[cx + cy*img_w] = color; 
+void map_show_sprite(Sprite &sprite, FrameBuffer &fb, Map &map) {
+    const size_t rect_w = fb.w/(map.w*2);
+    const size_t rect_h = fb.h/map.h;
+    fb.draw_rectangle(sprite.x*rect_w-3, sprite.y*rect_h-3, 6, 6, pack_color(255, 0, 0));
+}
+
+void render(FrameBuffer &fb, Map &map, Player &player, std::vector<Sprite> &sprites, Texture &tex_walls, Texture &tex_monst) {
+    fb.clear(pack_color(255, 255, 255)); // clear the screen
+
+    const size_t rect_w = fb.w/(map.w*2); // size of one map cell on the screen
+    const size_t rect_h = fb.h/map.h;
+    for (size_t j=0; j<map.h; j++) {  // draw the map
+        for (size_t i=0; i<map.w; i++) {
+            if (map.is_empty(i, j)) continue; // skip empty spaces
+            size_t rect_x = i*rect_w;
+            size_t rect_y = j*rect_h;
+            size_t texid = map.get(i, j);
+            assert(texid<tex_walls.count);
+            fb.draw_rectangle(rect_x, rect_y, rect_w, rect_h, tex_walls.get(0, 0, texid)); // the color is taken from the upper left pixel of the texture #texid
         }
     }
-}
 
-bool load_texture(const std::string filename, std::vector<uint32_t> &texture, size_t &text_size, size_t &text_cnt) {
-    int nchannels = -1, w, h;
-    unsigned char *pixmap = stbi_load(filename.c_str(), &w, &h, &nchannels, 0);
-    if (!pixmap) {
-        std::cerr << "Error: can not load the textures" << std::endl;
-        return false;
-    }
+    for (size_t i=0; i<fb.w/2; i++) { // draw the visibility cone AND the "3D" view
+        float angle = player.a-player.fov/2 + player.fov*i/float(fb.w/2);
+        for (float t=0; t<20; t+=.01) { // ray marching loop
+            float x = player.x + t*cos(angle);
+            float y = player.y + t*sin(angle);
+            fb.set_pixel(x*rect_w, y*rect_h, pack_color(160, 160, 160)); // this draws the visibility cone
 
-    if (4!=nchannels) {
-        std::cerr << "Error: the te3xture must be a 32 bit image" << std::endl;
-        stbi_image_free(pixmap);
-        return false;
-    }
+            if (map.is_empty(x, y)) continue;
 
-    text_cnt = w/h;
-    text_size = w/text_cnt;
-    if (w! = h*int(text_cnt)) {
-        std::cerr << "Error: the texture file must containn N square textures packed horizontally" << std::endl;
-        stbi_image_free(pixmap);
-        return false;
-    }
+            size_t texid = map.get(x, y); // our ray touches a wall, so draw the vertical column to create an illusion of 3D
+            assert(texid<tex_walls.count);
+            float dist = t*cos(angle-player.a);
+            size_t column_height = fb.h/dist;
+            int x_texcoord = wall_x_texcoord(x, y, tex_walls);
+            std::vector<uint32_t> column = tex_walls.get_scaled_column(texid, x_texcoord, column_height);
+            int pix_x = i + fb.w/2; // we are drawing at the right half of the screen, thus +fb.w/2
+            for (size_t j=0; j<column_height; j++) { // copy the texture column to the framebuffer
+                int pix_y = j + fb.h/2 - column_height/2;
+                if (pix_y>=0 && pix_y<(int)fb.h) {
+                    fb.set_pixel(pix_x, pix_y, column[j]);
+                }
+            }
+            break;
+        } // ray marching loop
+    } // field of view ray sweeping
 
-    texture = std::vector<uint32_t>(w*h);
-    for (int j=0; j<h; j++) {
-        for (int i=0; i<w; i++) {
-            uint8_t r = pixmap[(i+j*w)*4+0];
-            uint8_t g = pixmap[(i+j*w)*4+1];
-            uint8_t b = pixmap[(i+j*w)*4+2];
-            uint8_t a = pixmap[(i+j*w)*4+3];
-            texture[i+j*w] = pack_color(r, g, b, a);
-        }
+    for (size_t i=0; i<sprites.size(); i++) {
+        map_show_sprite(sprites[i], fb, map);
     }
-    stbi_image_free(pixmap);
-    return true;
 }
 
 int main() {
-    const size_t win_w = 512; //image width
-    const size_t win_h = 512; //image height
-    std::vector<uint32_t> framebuffer(win_w*win_h, 255); // image itself, initialized to white
-
-    const size_t map_w = 16; //width
-    const size_t map_h = 16; //height
-    const char map[] = "0000222222220000"\
-                       "1              0"\
-                       "1      11111   0"\
-                       "1     0        0"\
-                       "0     0  1110000"\
-                       "0     3        0"\
-                       "0   10000      0"\
-                       "0   3   11100  0"\
-                       "5   4   0      0"\
-                       "5   4   1  00000"\
-                       "0       1      0"\
-                       "2       1      0"\
-                       "0       0      0"\
-                       "0 0000000      0"\
-                       "0              0"\
-                       "0002222222200000"; // game map 
-    assert(sizeof(map) == map_w*map_h+1); // +1 for null terminated string
-    float player_x = 3.456;
-    float player_y = 2.345;
-    float player_a = 1.523;
-    const float fov = M_PI/3.;
-
-    const size_t ncolors = 10;
-    std::vector<uint32_t> colors(ncolors);
-    for(size_t i=0; i<ncolors; i++) {
-        colors[i] = pack_color(rand()%255, rand()%255, rand()%255);
-    }
-
-    std::vector<uint32_t> walltext;
-    size_t walltext_size;
-    size_t walltext_cnt;
-    if(!load_texture("../walltext.png", walltext, walltext_size, walltext_cnt)) {
-        std::cerr << "Failed to load wall textures" << std::endl;
+    FrameBuffer fb{1024, 512, std::vector<uint32_t>(1024*512, pack_color(255, 255, 255))};
+    Player player{3.456, 2.345, 1.523, M_PI/3.};
+    Map map;
+    Texture tex_walls("../walltext.png");
+    Texture tex_monst("../monsters.png");
+    if (!tex_walls.count || !tex_monst.count) {
+                std::cerr << "Failed to textures" << std::endl;
         return -1;
     }
+    std::vector<Sprite> sprites{ {1.834, 8.765, 0}, {5.323, 5.365, 1}, {4.123, 10.265, 1} };
 
-    const size_t rect_w = win_w/map_w;
-    const size_t rect_h = win_h/map_h;
-    for (size_t j=0; j<map_h; j++) {
-        for (size_t i=0; i<map_w; i++) {
-            if (map[i+j*map_w]==' ') continue; // skip empty spaces
-            size_t rect_x = i*rect_w;
-            size_t rect_y = i*rect_h;
-            size_t texid = map[i+j*map_w] - '0';
-            assert(texid<walltext_cnt);
-            draw_rectangle(framebuffer, win_w, win_h, rect_x, rect_y, rect_w, rect_h, walltext[texid*walltext_size]);
-        }
-    }
-
-    for (size_t i=0; i<win_w/2; i++) {
-        float angle = player_a-fov/2 + fov*i/float(win_w/2);
-        for (float t=0; t<20; t+=.01) {
-            float cx = player_x + t*cos(angle);
-            float cy = player_y + t*sin(angle);
-
-            size_t pix_x = cx*rect_w;
-            size_t pix_y = cy*rect_h;
-            framebuffer[pix_x + pix_y*win_w] = pack_color(160, 160, 160); //draws visibility code
-
-            if (map[int(cx)+int(cy)*map_w]!=' ') { // ray touches wall
-                size_t texid = map[int(cx)+int(cy)*map_w] - '0';
-                assert(texid<walltext_cnt);
-
-                size_t column_height = win_h/(t*cos(angle-player_a));
-
-                draw_rectangle(framebuffer, win_w, win_h, win_w/2+i, win_h/2-column_height/2, 1, column_height, walltext[texid*walltext_size]);
-                break;
-            }
-        }
-    }
-
-    drop_ppm_image("./out.ppm", framebuffer, win_w, win_h);
+    render(fb, map, player, sprites, tex_walls, tex_monst);
+    drop_ppm_image("./out.ppm", fb.img, fb.w, fb.h);
 
     return 0;
 }
