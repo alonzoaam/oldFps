@@ -2,11 +2,11 @@
 #include <cmath>
 #include <iostream>
 #include <fstream>
-#include <sstream>
-#include <iomanip>
 #include <vector>
 #include <cstdint>
 #include <cassert>
+#define STB_IMAGE_IMPLEMENTATION
+#include "stb_image.h"
 
 // colors are stored in uint32_t (four bytes) R, G, B, A
 uint32_t pack_color(const uint8_t r, const uint8_t g, const uint8_t b, const uint8_t a=255) {
@@ -45,6 +45,42 @@ void draw_rectangle(std::vector<uint32_t> &img, const size_t img_w, const size_t
     }
 }
 
+bool load_texture(const std::string filename, std::vector<uint32_t> &texture, size_t &text_size, size_t &text_cnt) {
+    int nchannels = -1, w, h;
+    unsigned char *pixmap = stbi_load(filename.c_str(), &w, &h, &nchannels, 0);
+    if (!pixmap) {
+        std::cerr << "Error: can not load the textures" << std::endl;
+        return false;
+    }
+
+    if (4!=nchannels) {
+        std::cerr << "Error: the te3xture must be a 32 bit image" << std::endl;
+        stbi_image_free(pixmap);
+        return false;
+    }
+
+    text_cnt = w/h;
+    text_size = w/text_cnt;
+    if (w! = h*int(text_cnt)) {
+        std::cerr << "Error: the texture file must containn N square textures packed horizontally" << std::endl;
+        stbi_image_free(pixmap);
+        return false;
+    }
+
+    texture = std::vector<uint32_t>(w*h);
+    for (int j=0; j<h; j++) {
+        for (int i=0; i<w; i++) {
+            uint8_t r = pixmap[(i+j*w)*4+0];
+            uint8_t g = pixmap[(i+j*w)*4+1];
+            uint8_t b = pixmap[(i+j*w)*4+2];
+            uint8_t a = pixmap[(i+j*w)*4+3];
+            texture[i+j*w] = pack_color(r, g, b, a);
+        }
+    }
+    stbi_image_free(pixmap);
+    return true;
+}
+
 int main() {
     const size_t win_w = 512; //image width
     const size_t win_h = 512; //image height
@@ -59,9 +95,9 @@ int main() {
                        "0     0  1110000"\
                        "0     3        0"\
                        "0   10000      0"\
-                       "0   0   11100  0"\
-                       "0   0   0      0"\
-                       "0   0   1  00000"\
+                       "0   3   11100  0"\
+                       "5   4   0      0"\
+                       "5   4   1  00000"\
                        "0       1      0"\
                        "2       1      0"\
                        "0       0      0"\
@@ -80,48 +116,50 @@ int main() {
         colors[i] = pack_color(rand()%255, rand()%255, rand()%255);
     }
 
+    std::vector<uint32_t> walltext;
+    size_t walltext_size;
+    size_t walltext_cnt;
+    if(!load_texture("../walltext.png", walltext, walltext_size, walltext_cnt)) {
+        std::cerr << "Failed to load wall textures" << std::endl;
+        return -1;
+    }
+
     const size_t rect_w = win_w/map_w;
     const size_t rect_h = win_h/map_h;
-    for (size_t frame=0; frame<360; frame++) {
-        std::stringstream ss;
-        ss << std::setfill('0') << std::setw(5) << frame << ".ppm";
-        player_a += 2*M_PI/360;
+    for (size_t j=0; j<map_h; j++) {
+        for (size_t i=0; i<map_w; i++) {
+            if (map[i+j*map_w]==' ') continue; // skip empty spaces
+            size_t rect_x = i*rect_w;
+            size_t rect_y = i*rect_h;
+            size_t texid = map[i+j*map_w] - '0';
+            assert(texid<walltext_cnt);
+            draw_rectangle(framebuffer, win_w, win_h, rect_x, rect_y, rect_w, rect_h, walltext[texid*walltext_size]);
+        }
+    }
 
-        framebuffer = std::vector<uint32_t>(win_w*win_h, pack_color(255, 255, 255)); // clear screen
+    for (size_t i=0; i<win_w/2; i++) {
+        float angle = player_a-fov/2 + fov*i/float(win_w/2);
+        for (float t=0; t<20; t+=.01) {
+            float cx = player_x + t*cos(angle);
+            float cy = player_y + t*sin(angle);
 
-        for(size_t j=0; j<map_h; j++) { // draw map
-            for(size_t i=0; i<map_w; i++) {
-                if(map[i+j*map_w] == ' ') continue; //skip empty spaces
-                size_t rect_x = i*rect_w;
-                size_t rect_y = j*rect_h;
-                size_t icolor = map[i+j*map_w] - '0';
-                assert(icolor<ncolors);
-                draw_rectangle(framebuffer, win_w, win_h, rect_x, rect_y, rect_w, rect_h, pack_color(0,255,255));
+            size_t pix_x = cx*rect_w;
+            size_t pix_y = cy*rect_h;
+            framebuffer[pix_x + pix_y*win_w] = pack_color(160, 160, 160); //draws visibility code
+
+            if (map[int(cx)+int(cy)*map_w]!=' ') { // ray touches wall
+                size_t texid = map[int(cx)+int(cy)*map_w] - '0';
+                assert(texid<walltext_cnt);
+
+                size_t column_height = win_h/(t*cos(angle-player_a));
+
+                draw_rectangle(framebuffer, win_w, win_h, win_w/2+i, win_h/2-column_height/2, 1, column_height, walltext[texid*walltext_size]);
+                break;
             }
         }
-
-        for(size_t i=0; i<win_w/2; i++) { // draw visibility cone and 3d view
-            float angle = player_a-fov/2 + fov*i/float(win_w/2);
-            for (float t=0; t<20; t+=.01) {
-                    float cx = player_x + t*cos(player_a);
-                    float cy = player_y + t*sin(player_a);
-                    if(map[int(cx)+int(cy)*map_w]!=' ') break;
-
-                    size_t pix_x = cx*rect_w;
-                    size_t pix_y = cy*rect_h;
-                    framebuffer[pix_x + pix_y*win_w] = pack_color(160,160,160); //draws visibility cone
-                    if (map[int(cx)+int(cy)*map_w]!=' ') {
-                        size_t icolor=map[int(cx) + int(cy)*map_w] - '0';
-                        assert(icolor<ncolors);
-                        size_t column_height = win_h/(t*cos(angle-player_a));
-                        draw_rectangle(framebuffer, win_w, win_h, win_w/2+i, win_h/2-column_height/2, 1, column_height, colors[icolor]);
-                        break;
-                    }
-                }
-        }
-        drop_ppm_image(ss.str(), framebuffer, win_w, win_h);
     }
-    
+
+    drop_ppm_image("./out.ppm", framebuffer, win_w, win_h);
 
     return 0;
 }
